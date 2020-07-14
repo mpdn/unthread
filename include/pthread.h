@@ -10,12 +10,15 @@
 
 #define UNTHREAD
 
-static const struct pthread_list pthread_empty_list = {
-    .len = 0,
-    .cap =
-        sizeof((struct pthread_list){}.threads.small) /
-        sizeof(*(struct pthread_list){}.threads.small),
-};
+#define PTHREAD_EMPTY_LIST_INITIALIZER                      \
+    {                                                       \
+        .len = 0,                                           \
+        .cap =                                              \
+            sizeof((struct pthread_list){}.threads.small) / \
+            sizeof(*(struct pthread_list){}.threads.small), \
+    }
+
+static const struct pthread_list pthread_empty_list = PTHREAD_EMPTY_LIST_INITIALIZER;
 
 #define PTHREAD_CANCELED ((void *)(-1))
 
@@ -52,10 +55,11 @@ void pthread_cleanup_pop_inner(int execute);
 #define pthread_cleanup_pop(execute) pthread_cleanup_pop_inner(execute); }
 
 #define PTHREAD_MUTEX_INITIALIZER { .locked_by = NULL, .initialized = 1, \
-    .waiting = pthread_empty_list, .type = PTHREAD_MUTEX_NORMAL }
-#define PTHREAD_COND_INITIALIZER { .waiting = pthread_empty_list, .initialized = 1 }
+    .waiting = PTHREAD_EMPTY_LIST_INITIALIZER, .type = PTHREAD_MUTEX_NORMAL }
+#define PTHREAD_COND_INITIALIZER { .waiting = PTHREAD_EMPTY_LIST_INITIALIZER, .initialized = 1 }
 #define PTHREAD_RWLOCK_INITIALIZER { .initialized = 1, .writer = NULL, \
-    .pending_readers = pthread_empty_list, .pending_writers = pthread_empty_list }
+    .pending_readers = PTHREAD_EMPTY_LIST_INITIALIZER, \
+    .pending_writers = PTHREAD_EMPTY_LIST_INITIALIZER }
 #define PTHREAD_ONCE_INIT 1
 
 int pthread_getschedparam(pthread_t thread, int *policy, struct sched_param *param);

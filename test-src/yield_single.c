@@ -5,10 +5,7 @@
 
 /*
 BEGIN_TEST_SPEC
-[
-    {"stdout": "1"},
-    {"stdout": "2"}
-]
+["1", "2"]
 END_TEST_SPEC
 */
 

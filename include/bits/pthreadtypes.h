@@ -8,21 +8,24 @@
 
 typedef struct pthread_fiber *pthread_t;
 
+// We would rather not expose these internals, but C does not leave us much choice unless we want to
+// heap allocate each of these.
+
 struct pthread_fiber;
 struct pthread_list {
     size_t len;
     size_t cap;
     union {
+        // Store a small list inline or a large list on the heap. Possibly an unnecessary
+        // micro-optimization, but eh.
         struct pthread_fiber *small[4];
         struct pthread_fiber **big;
     } threads;
 };
 
-struct pthread_multiset_entry {
-    pthread_t thread;
-    size_t count;
-};
+struct pthread_multiset_entry;
 
+// Multiset of threads. Used for keeping track of readers in rwlocks.
 struct pthread_multiset {
     size_t len;
     size_t cap;
@@ -44,6 +47,8 @@ typedef struct {
     int robust;
 } pthread_mutexattr_t;
 
+// pthread_attr_t is defined as a union somewhere in some glibc header, so we pretend its a union
+// here as well.
 union pthread_attr_t {
     struct {
         int initialized;
@@ -58,6 +63,7 @@ union pthread_attr_t {
     } data;
 };
 
+// glibc workaround
 #ifndef __have_pthread_attr_t
 typedef union pthread_attr_t pthread_attr_t;
 # define __have_pthread_attr_t 1

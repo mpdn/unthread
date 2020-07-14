@@ -44,17 +44,24 @@
         }                                                            \
     } while (false)
 
-#define ASSERT_UNREACHABLE() (assert(!("Unthread: This should be unreachable")))
+#define ASSERT_UNREACHABLE() (assert(!("Unthread: This should not be reachable")))
 
 static bool verbose;
 
 enum thread_state {
+    // State of a thread after joining. This should essentially be seen as deallocated and any
+    // attempt to join with it is an error.
     TERMINATED,
-    STARTED,
+
+    // When the thread has been canceled/called pthread_exit but has not been joined yet. The thread
+    // is still there until another thread joins with it.
     STOPPED,
+
     RUNNING,
 
-    BLOCK_YIELD,
+    YIELD,
+
+    // State for being blocked on the various pthread blocking calls.
     BLOCK_LOCK,
     BLOCK_JOIN,
     BLOCK_MUTEX_LOCK,
@@ -83,7 +90,7 @@ static const struct exit_reason EXIT_UNSUPPORTED = { 6 };
 #define RETCODE_OFFSET_ENV "UNTHREAD_RET_OFFSET"
 #define PRNG_SEED_ENV "UNTHREAD_SEED"
 #define VERBOSE_ENV "UNTHREAD_VERBOSE"
-#define NOISE_FILE_ENV "UNTHREAD_NOISE"
+#define NOISE_FILE_ENV "UNTHREAD_FILE"
 
 static void exit_reasoned(const struct exit_reason reason) {
     int retcode_offset = 40;
@@ -108,8 +115,15 @@ static void exit_reasoned(const struct exit_reason reason) {
     exit(retcode_offset + reason.retcode_offset);
 }
 
+// The fraction determining when hashtables should grow. Unthread uses Robin Hood hashtables, so
+// they should perform pretty well even for high load.
 static const size_t HASH_LOAD_NOM = 4;
 static const size_t HASH_LOAD_DENOM = 5;
+
+struct pthread_multiset_entry {
+    pthread_t thread;
+    size_t count;
+};
 
 struct tls_entry {
     size_t id;
@@ -123,16 +137,27 @@ struct tls {
 };
 
 struct pthread_fiber {
+    unsigned int id;
+
     bool detached;
     bool owns_stack;
-    enum thread_state state;
 
-    // The indexes of 
+    // The index of this thread in the lists we are currently a member of.
+    //
+    // For example, when waiting on a mutex the current thread is added to the list. Having the
+    // index in the thread itself means operations like pop_specific can be implemented in O(1)
+    // time.
+    //
+    // A thread may be a member of the threads_ready list in addition to one other list. This means
+    // there are two "slots" for indices, with 0 being for the index in the threads_ready list and 1
+    // for the index in the other list. This is used when blocking on a timed lock, where a thread
+    // may both be ready (for the purposes of Unthread) and waiting on a lock at the same time.
     size_t list_index[2];
 
+    // pthread_attr_t used to create this thread.
     pthread_attr_t attr;
 
-    unsigned int id;
+    enum thread_state state;
 
     union {
         // When blocked on pthread_join, contains the thread being joined
@@ -180,40 +205,47 @@ struct pthread_fiber {
     char stack[];
 };
 
-static const pthread_attr_t default_attr = {{
-    .initialized = true,
-    .detach_state = PTHREAD_CREATE_JOINABLE,
-    .guard_size = 0,
-    .inherit_sched = PTHREAD_INHERIT_SCHED,
-    .scope = PTHREAD_SCOPE_PROCESS,
-    .sched_param = (struct sched_param) { },
-    .sched_policy = SCHED_OTHER,
-    .stack_addr = NULL,
-    .stack_size = 1 << 20,
-}};
+#define DEFAULT_ATTR_INITIALIZER                 \
+    {{                                           \
+        .initialized = true,                     \
+        .detach_state = PTHREAD_CREATE_JOINABLE, \
+        .guard_size = 0,                         \
+        .inherit_sched = PTHREAD_INHERIT_SCHED,  \
+        .scope = PTHREAD_SCOPE_PROCESS,          \
+        .sched_param = (struct sched_param) { }, \
+        .sched_policy = SCHED_OTHER,             \
+        .stack_addr = NULL,                      \
+        .stack_size = 1 << 20,                   \
+    }}
+
+static const pthread_attr_t default_attr = DEFAULT_ATTR_INITIALIZER;
 
 static struct pthread_fiber main_thread = {
     .id = 1,
     .state = RUNNING,
-    .attr = default_attr,
+    .attr = DEFAULT_ATTR_INITIALIZER,
     .cancel_state = PTHREAD_CANCEL_ENABLE,
     .cancel_type = PTHREAD_CANCEL_DEFERRED,
     .sched_policy = SCHED_OTHER,
+    .list_index = {-1, -1},
 };
 
-static size_t next_key_id = 1;
-static unsigned int next_id = 2;
+// Current running thread
 static pthread_t current = &main_thread;
-static struct pthread_list threads_ready = pthread_empty_list;
-static size_t threads_count = 1;
-static FILE *noise_file;
-static uint8_t noise_buf[NOISE_BUF_SIZE];
-static size_t noise_offset = 0;
-static size_t noise_len = 0; 
-static uint32_t noise_min = 0;
-static uint32_t noise_max = UINT32_MAX;
 
+// List of threads ready to run
+static struct pthread_list threads_ready = PTHREAD_EMPTY_LIST_INITIALIZER;
+
+// Number of live threads in the system
+static size_t threads_count = 1;
+
+// True if we are using PRNG-based entropy or false if file-based entropy
 static bool noise_prng;
+
+// File for file-based entropy
+static FILE *noise_file;
+
+// State for PRGN-based entropy
 static uint32_t noise_prng_state[4];
 
 void __attribute__((constructor)) pthread_constructor() {
@@ -248,11 +280,10 @@ void __attribute__((constructor)) pthread_constructor() {
             noise_prng_state[i / HEX_ELEM_LEN] <<= 4;
             noise_prng_state[i / HEX_ELEM_LEN] |= unhexed;
         }
-    } else if (file_str != NULL) {
+    } else {
+        CHECK(EXIT_MISC, file_str != NULL, "No seed or entropy file specified");
         noise_file = fopen(file_str, "r");
         CHECK(EXIT_IO, noise_file != NULL, "Failed reading noise file: %s", strerror(errno));
-    } else {
-        noise_file = stdin;
     }
 }
 
@@ -260,8 +291,9 @@ static inline uint32_t rotl(const uint32_t x, int k) {
 	return (x << k) | (x >> (32 - k));
 }
 
-// xoshiro128** 1.1
-// TODO: attribute better
+// xoshiro128** 1.1 PRNG
+// Written in 2018 by David Blackman and Sebastiano Vigna (vigna@acm.org)
+// From http://prng.di.unimi.it/xoshiro128starstar.c
 uint32_t rand_u32_prng(uint32_t len) {
 	const uint32_t result = rotl(noise_prng_state[1] * 5, 7) * 9;
 	const uint32_t t = noise_prng_state[1] << 9;
@@ -285,6 +317,12 @@ static uint32_t rand_u32_io(uint32_t len) {
     //
     // It's not totally clear if the above benefits outweighs its generally slow performance.
 
+    static uint32_t noise_min = 0;
+    static uint32_t noise_max = UINT32_MAX;
+    static uint8_t buf[NOISE_BUF_SIZE];
+    static size_t buf_offset = 0;
+    static size_t buf_len = 0;
+
     assert(len > 0);
 
     if (len == 1) {
@@ -301,17 +339,16 @@ static uint32_t rand_u32_io(uint32_t len) {
             break;
         }
 
-        if (noise_offset >= noise_len) {
-            noise_len = fread(noise_buf, sizeof(*noise_buf),
-                sizeof(noise_buf) / sizeof(*noise_buf), stdin);
-            noise_offset = 0;
+        if (buf_offset >= len) {
+            buf_len = fread(buf, sizeof(*buf), sizeof(buf) / sizeof(*buf), noise_file);
+            buf_offset = 0;
 
-            CHECK(EXIT_ENTROPY, noise_len != 0 || !feof(stdin), "Entropy exhausted");
-            CHECK(EXIT_IO, noise_len != 0, "IO Error: %s", strerror(ferror(stdin)));
+            CHECK(EXIT_ENTROPY, buf_len != 0 || !feof(noise_file), "Entropy exhausted");
+            CHECK(EXIT_IO, buf_len != 0, "IO Error: %s", strerror(ferror(noise_file)));
         }
 
         uint64_t noise_size = (uint64_t)(noise_max - noise_min) + 1;
-        uint8_t noise_segment = noise_buf[noise_offset++];
+        uint8_t noise_segment = buf[buf_offset++];
 
         noise_min += (noise_size * noise_segment) >> 8;
         noise_max -= ((noise_size * (UINT8_MAX - noise_segment)) >> 8) - 1;
@@ -372,25 +409,37 @@ static struct pthread_fiber** threads_ptr(struct pthread_list* list) {
         : list->threads.small;
 }
 
+// Pushes a thread onto the given list. A thread can only be in the the threads_ready and one
+// other list at the same time. It is an error to add a thread to a list multiple times or to
+// add a thread to a non-threads_ready list while it is a member of another non-threads_ready list.
 static void push(struct pthread_list* list, pthread_t thread) {
     ensure_cap(list, 1);
     size_t index = list->len++;
     threads_ptr(list)[index] = thread;
-    thread->list_index[list != &threads_ready] = index;
+    int list_slot = list != &threads_ready;
+    assert(thread->list_index[list_slot] == -1);
+    thread->list_index[list_slot] = index;
 }
 
 static void append(struct pthread_list *target, struct pthread_list* source) {
     ensure_cap(target, source->len);
 
     pthread_t *target_ptr = threads_ptr(target) + target->len;
+    int source_slot = source != &threads_ready;
+    int target_slot = target != &threads_ready;
 
     memcpy(
         target_ptr,
         threads_ptr(source),
-        sizeof(*threads_ptr(source)) * source->len);
+        sizeof(*target_ptr) * source->len);
 
     for (size_t i = 0; i < source->len; i++) {
-        target_ptr[i]->list_index[target != &threads_ready] += target->len;
+        size_t *list_index = target_ptr[i]->list_index;
+
+        size_t ix = list_index[source_slot];
+        list_index[source_slot] = -1;
+        assert(list_index[target_slot] == -1);
+        list_index[target_slot] = ix + target->len;
     }
 
     target->len += source->len;
@@ -401,6 +450,7 @@ static struct pthread_fiber* pop_random(struct pthread_list* list) {
     assert(list->len > 0);
 
     size_t pick = 0;
+    int list_slot = list != &threads_ready;
 
     if (list->len >= 1) {
         pick = rand_u32(list->len);
@@ -408,14 +458,25 @@ static struct pthread_fiber* pop_random(struct pthread_list* list) {
 
     pthread_t *threads = threads_ptr(list);
     pthread_t popped = threads[pick];
+
+    assert(threads[pick]->list_index[list_slot] == pick);
     threads[pick] = threads[--list->len];
-    threads[pick]->list_index[list != &threads_ready] = pick;
+    threads[pick]->list_index[list_slot] = pick;
+    popped->list_index[list_slot] = -1;
     return popped;
 }
 
 static void pop_specific(struct pthread_list* list, pthread_t thread) {
+    assert(list->len > 0);
+    int list_slot = list != &threads_ready;
     pthread_t *threads = threads_ptr(list);
-    threads[thread->list_index[list != &threads_ready]] = threads[--list->len];
+
+    size_t index = thread->list_index[list_slot];
+
+    assert(threads[index] == thread);
+    threads[index] = threads[--list->len];
+    threads[index]->list_index[list_slot] = index;
+    thread->list_index[list_slot] = -1;
 }
 
 static void multisetset_insert_base(
@@ -564,7 +625,7 @@ int pthread_yield() {
     }
 
     push(&threads_ready, current);
-    yield(BLOCK_YIELD);
+    yield(YIELD);
     return 0;
 }
 
@@ -677,6 +738,7 @@ int pthread_create(
         : malloc(attr->data.stack_size);
 
     unsigned int id;
+    static unsigned int next_id = 2; // Start at 2 as main thread is 1
 
     do {
         id = next_id++;
@@ -684,7 +746,7 @@ int pthread_create(
     
     *child = (struct pthread_fiber){
         .id = id,
-        .state = STARTED,
+        .state = YIELD,
         .owns_stack = owns_stack,
         .detached = attr->data.detach_state == PTHREAD_CREATE_DETACHED,
         .sched_policy = attr->data.inherit_sched == PTHREAD_EXPLICIT_SCHED
@@ -696,6 +758,7 @@ int pthread_create(
         .attr = *attr,
         .cancel_state = PTHREAD_CANCEL_ENABLE,
         .cancel_type = PTHREAD_CANCEL_DEFERRED,
+        .list_index = {-1, -1},
     };
 
     *thread = child;
@@ -814,13 +877,11 @@ void pthread_exit(void *retval) {
     free(current->tls.entries);
 
     current->state_data.retval = retval;
+    threads_count--;
 
     if (current->detached) {
         terminate(current);
     } else {
-        current->state = STOPPED;
-        threads_count--;
-
         // Mark any waiting threads as ready
         if (current->joined_by != NULL) {
             LOG("%u waking joining %u", current->id, current->joined_by->id);
@@ -906,17 +967,18 @@ int pthread_mutex_lock(pthread_mutex_t *mutex) {
     if (mutex->locked_by == NULL) {
         mutex->locked_by = current;
         LOG("%u locked mutex at %p", current->id, mutex);
-    } else if (mutex->type == PTHREAD_MUTEX_ERRORCHECK && current->id == mutex->locked_by->id) {
+    } else if (mutex->type == PTHREAD_MUTEX_ERRORCHECK && current == mutex->locked_by) {
         LOG("%u tried relocking error-checked mutex %p, but failed due to lock already held",
             current->id, mutex);
         return EDEADLK;
-    } else if (mutex->type == PTHREAD_MUTEX_RECURSIVE && current->id == mutex->locked_by->id) {
+    } else if (mutex->type == PTHREAD_MUTEX_RECURSIVE && current == mutex->locked_by) {
         CHECK(EXIT_ILLEGAL, mutex->rec_count <= UNTHREAD_MAX_RECURSIVE_LOCKS,
             "%u hit recusive lock limit on mutex at %p (%u)", current->id, mutex, mutex->rec_count);
         LOG("%u locked mutex at %p recursively (%u)", current->id, mutex, mutex->rec_count);
-    } else if (false) {
-        
     } else {
+        CHECK(EXIT_DEADLOCK, current != mutex->locked_by,
+            "%u tried locking mutex at %p held by self", current->id, mutex);
+
         LOG("%u blocked waiting for mutex at %p held by %u",
             current->id, mutex, mutex->locked_by->id);
 
@@ -951,8 +1013,15 @@ int pthread_mutex_trylock(pthread_mutex_t *mutex) {
 
 int pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *abs_timeout) {
     CHECK(EXIT_ILLEGAL, mutex->initialized, "Mutex not initialized");
-    
-    if (mutex->type == PTHREAD_MUTEX_RECURSIVE && current == mutex->locked_by) {
+
+    if (mutex->locked_by == NULL) {
+        mutex->locked_by = current;
+        LOG("%u locked mutex at %p", current->id, mutex);
+    } else if (mutex->type == PTHREAD_MUTEX_ERRORCHECK && current == mutex->locked_by) {
+        LOG("%u tried relocking error-checked mutex %p, but failed due to lock already held",
+            current->id, mutex);
+        return EDEADLK;
+    } else if (mutex->type == PTHREAD_MUTEX_RECURSIVE && current == mutex->locked_by) {
         CHECK(EXIT_ILLEGAL, mutex->rec_count <= UNTHREAD_MAX_RECURSIVE_LOCKS,
             "%u hit recusive lock limit on mutex at %p (%u)", current->id, mutex, mutex->rec_count);
         LOG("%u locked mutex at %p recursively (%u)", current->id, mutex, mutex->rec_count);
@@ -965,13 +1034,12 @@ int pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *abs_t
 
         yield(BLOCK_MUTEX_TIMEDLOCK);
 
-        if (mutex->locked_by != current) {
+        if (mutex->locked_by == current) {
+            LOG("%u locked mutex at %p", current->id, mutex);
+        } else {
             LOG("%u timed out waiting for mutex at %p", current->id, mutex);
             pop_specific(&mutex->waiting, current);
             return ETIMEDOUT;
-        } else {
-            LOG("%u locked mutex at %p", current->id, mutex);
-            pop_specific(&threads_ready, current);
         }
     }
 
@@ -1016,8 +1084,21 @@ static int mutex_unlock_noyield(pthread_mutex_t *mutex) {
         // Schedule a waiting thread, if any
         if (mutex->waiting.len != 0) {
             mutex->locked_by = pop_random(&mutex->waiting);
-            push(&threads_ready, mutex->locked_by);
             LOG("%u waking blocked thread %u", current->id, mutex->locked_by->id);
+
+            switch (mutex->locked_by->state) {
+                case BLOCK_COND_WAIT:
+                case BLOCK_MUTEX_LOCK:
+                    push(&threads_ready, mutex->locked_by);
+                    break;
+                case BLOCK_COND_TIMEDWAIT:
+                case BLOCK_MUTEX_TIMEDLOCK:
+                    // Already pushed on threads_ready, so don't do anything
+                    break;
+                default:
+                    ASSERT_UNREACHABLE();
+            }
+
         }
     }
 
@@ -1088,27 +1169,53 @@ int pthread_cond_signal(pthread_cond_t *cond) {
         if (popped->state_data.cond_mutex->locked_by == NULL) {
             popped->state_data.cond_mutex->locked_by = popped;
 
+            LOG("%u signalling cond at %p, waking %u now locks mutex at %p", current->id, cond,
+                popped->id, popped->state_data.cond_mutex);
+
             if (!popped->canceled && popped->cancel_state == PTHREAD_CANCEL_ENABLE) {
                 push(&threads_ready, popped);
             }
         } else {
+            LOG("%u signalling cond at %p, waking %u now waiting on mutex at %p", current->id, cond,
+                popped->id, popped->state_data.cond_mutex);
+
+            // TODO: What if recursive lock or some other kind?
             push(&popped->state_data.cond_mutex->waiting, popped);
+            
+            switch (popped->state) {
+                case BLOCK_COND_WAIT:
+                    break;
+                case BLOCK_COND_TIMEDWAIT:
+                    if (!popped->canceled) {
+                        pop_specific(&threads_ready, popped);                        
+                    }
+                    break;
+                default:
+                    ASSERT_UNREACHABLE();
+            }
+
+            // When a cond_timedwait is triggered or times out, it relocks the mutex but this
+            // relocking is *not timed*. So this becomes a BLOCK_MUTEX_LOCK whether it is timed or
+            // not
+            popped->state = BLOCK_MUTEX_LOCK;
         }
+    } else {
+        LOG("%u signalling cond at %p, none waiting", current->id, cond);
     }
 
     pthread_yield();
     return 0;
 }
 
-int pthread_cond_timedwait(pthread_cond_t * cond, 
-    pthread_mutex_t *mutex, const struct timespec *timeout)
+int pthread_cond_timedwait(pthread_cond_t * cond,  pthread_mutex_t *mutex,
+    const struct timespec *timeout)
 {
     CHECK(EXIT_ILLEGAL, cond->initialized, "Cond not initialized");
     CHECK(EXIT_ILLEGAL, mutex->initialized, "Mutex not initialized");
     CHECK(EXIT_ILLEGAL, mutex->locked_by == current,
         "pthread_cond_timedwait called with mutex locked by other thread");
 
-    LOG("%u timed-waiting on cond %p, releasing mutex %p", current->id, cond, mutex);
+    LOG("%u timed-waiting on cond %p, unlocking mutex at %p", current->id, cond, mutex);
 
     int ret = mutex_unlock_noyield(mutex);
     assert(ret == 0);
@@ -1120,11 +1227,7 @@ int pthread_cond_timedwait(pthread_cond_t * cond,
     yield(BLOCK_COND_TIMEDWAIT);
 
     if (mutex->locked_by == current) {
-        pop_specific(&threads_ready, current);
-
-        LOG("%u signaled waiting on cond %p, reacquiring mutex %p", current->id, cond, mutex);
-
-        pthread_mutex_lock(mutex);
+        LOG("%u signaled waiting on cond %p, locked mutex at %p", current->id, cond, mutex);
         return 0;
     } else {
         pop_specific(&cond->waiting, current);
@@ -1133,7 +1236,7 @@ int pthread_cond_timedwait(pthread_cond_t * cond,
             pthread_exit(PTHREAD_CANCELED);
         }
 
-        LOG("%u timed out waiting on cond %p, reacquiring mutex %p", current->id, cond, mutex);
+        LOG("%u timed out waiting on cond %p, relocking mutex %p", current->id, cond, mutex);
 
         pthread_mutex_lock(mutex);
         return ETIMEDOUT;
@@ -1141,6 +1244,7 @@ int pthread_cond_timedwait(pthread_cond_t * cond,
 }
 
 int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
+    LOG("%u waiting on cond at %p, unlocking mutex at %p", current->id, cond, mutex);
     mutex_unlock_noyield(mutex);
     current->state_data.cond_mutex = mutex;
     push(&cond->waiting, current);
@@ -1443,6 +1547,8 @@ void pthread_cleanup_pop_inner(int execute) {
 
 int pthread_key_create(pthread_key_t *key, void (*destructor)(void*)) {
     size_t id;
+
+    static size_t next_key_id = 1;
 
     do {
         id = next_key_id++;
@@ -1900,8 +2006,8 @@ int pthread_barrier_wait(pthread_barrier_t *barrier) {
     if (barrier->waiting.len == barrier->count) {
         pthread_t serial = pop_random(&barrier->waiting);
         serial->state_data.barrier_serial = true;
+        
         push(&threads_ready, serial);
-
         append(&threads_ready, &barrier->waiting);
 
         LOG("%u completed barrier at %p (%zu) - %u got serial", current->id, barrier,
