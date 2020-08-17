@@ -1,5 +1,5 @@
-#include <stdio.h>
 #include <pthread.h>
+#include <stdio.h>
 
 /*
 BEGIN_TEST_SPEC
@@ -8,8 +8,8 @@ END_TEST_SPEC
 */
 
 int main() {
-    pthread_cancel(pthread_self());
-    pthread_testcancel();
-    printf("NOT CANCELED");
-    return 0;
+  pthread_cancel(pthread_self());
+  pthread_testcancel();
+  printf("NOT CANCELED");
+  return 0;
 }

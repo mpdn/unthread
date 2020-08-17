@@ -119,5 +119,15 @@ test: posixtestsuite-test unthread-test
 clean:
 	rm -r bin
 
-.PHONY: posixtestsuite-build posixtestsuite-test unthread-test unthread-test-seeds clean bin/%-fuzz
+FORMAT_STYLE=google
+FORMAT_TARGETS=src/*.c include/*.h include/bits/*.h include-util/*.h test-src/*.c
+
+format:
+	clang-format -i $(FORMAT_TARGETS) --style=$(FORMAT_STYLE)
+
+format-check:
+	clang-format $(FORMAT_TARGETS) -n --style=$(FORMAT_STYLE) -Werror
+
+.PHONY: posixtestsuite-build posixtestsuite-test unthread-test unthread-test-seeds clean \
+	bin/%-fuzz format format-check
 .PRECIOUS: bin/% bin/%-pthread
