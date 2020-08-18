@@ -174,8 +174,9 @@ Testing
 The Unthread test runner requires Python 3 to be installed.
 
 Unthread is tested by the Unthread tests in the `test-src` dir and a set of tests from the POSIX
-Test Suite project in the `posixtestsuite`. See the [POSIX Test Suite project site]
-(https://sourceforge.net/projects/posixtest) for more information on the POSIX Test Suite.
+Test Suite project in the `posixtestsuite`. See the
+[POSIX Test Suite project site](https://sourceforge.net/projects/posixtest) for more information on
+the POSIX Test Suite.
 
 Unthread tests in the `test-src` directory are examples of non-deterministic pthread programs that
 are deterministic in Unthread with a given seed. The tests contains a spec containing all the
