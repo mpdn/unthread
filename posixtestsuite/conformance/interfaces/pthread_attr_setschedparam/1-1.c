@@ -1,4 +1,5 @@
-/*   
+		
+		/*   
  * Copyright (c) 2004, QUALCOMM Inc. All rights reserved.
  * Created by:  abisain REMOVE-THIS AT qualcomm DOT com
  * This file is licensed under the GPL license.  For the full content
@@ -37,7 +38,7 @@ void *thread_func()
 int main()
 {
 	pthread_t              thread;
-	pthread_attr_t         attr;
+	unthread_attr_t         attr;
  	void                   *status;
  	int                    rc=0;
 	int                    policy = FIFOPOLICY;

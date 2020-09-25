@@ -43,7 +43,7 @@ void *a_thread_func()
 
 int main()
 {
-	pthread_attr_t new_attr;
+	unthread_attr_t new_attr;
 	pthread_t new_th;
 	int ret;
 

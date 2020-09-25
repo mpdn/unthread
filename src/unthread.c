@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #undef _FORTIFY_SOURCE
 
-#include <../include/pthread.h>
+#include <pthread.h>
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -51,13 +51,11 @@ static bool verbose;
 
 enum thread_state {
   // State of a thread after joining. This should essentially be seen as
-  // deallocated and any
-  // attempt to join with it is an error.
+  // deallocated and any attempt to join with it is an error.
   TERMINATED,
 
   // When the thread has been canceled/called pthread_exit but has not been
-  // joined yet. The thread
-  // is still there until another thread joins with it.
+  // joined yet. The thread is still there until another thread joins with it.
   STOPPED,
 
   RUNNING,
@@ -120,7 +118,7 @@ static void exit_reasoned(const struct exit_reason reason) {
 static const size_t HASH_LOAD_NOM = 4;
 static const size_t HASH_LOAD_DENOM = 5;
 
-struct pthread_multiset_entry {
+struct unthread_multiset_entry {
   pthread_t thread;
   size_t count;
 };
@@ -136,25 +134,21 @@ struct tls {
   size_t cap, len;
 };
 
-struct pthread_fiber {
+struct list_slot {
+  struct unthread_fiber *prev, *next;
+};
+
+struct unthread_fiber {
   unsigned int id;
 
   bool detached;
   bool owns_stack;
 
-  // The index of this thread in the lists we are currently a member of.
-  //
-  // For example, when waiting on a mutex the current thread is added to the
-  // list. Having the index in the thread itself means operations like
-  // pop_specific can be implemented in O(1) time.
-  //
-  // A thread may be a member of the threads_ready list in addition to one
-  // other list. This means there are two "slots" for indices, with 0 being for
-  // the index in the threads_ready list and 1 for the index in the other list.
-  // This is used when blocking on a timed lock, where a thread may both be
-  // ready (for the purposes of Unthread) and waiting on a lock at the same
-  // time.
-  size_t list_index[2];
+  // The index of this thread in the free list.
+  size_t free_index;
+
+  // The next thread in the list this thread is partaking.
+  struct unthread_fiber *prev, *next;
 
   // pthread_attr_t used to create this thread.
   pthread_attr_t attr;
@@ -198,7 +192,7 @@ struct pthread_fiber {
   // asynchronous, we may act on them much sooner than it is sent.
   bool canceled;
 
-  pthread_cleanup_t *cleanup;
+  __pthread_unwind_buf_t *unwind;
 
   int sched_policy;
   struct sched_param sched_param;
@@ -208,7 +202,7 @@ struct pthread_fiber {
 
 #define DEFAULT_ATTR_INITIALIZER                                              \
   {                                                                           \
-    {                                                                         \
+    .ut = {                                                                   \
       .initialized = true, .detach_state = PTHREAD_CREATE_JOINABLE,           \
       .guard_size = 0, .inherit_sched = PTHREAD_INHERIT_SCHED,                \
       .scope = PTHREAD_SCOPE_PROCESS, .sched_param = (struct sched_param){},  \
@@ -218,21 +212,23 @@ struct pthread_fiber {
 
 static const pthread_attr_t default_attr = DEFAULT_ATTR_INITIALIZER;
 
-static struct pthread_fiber main_thread = {
+static struct unthread_fiber main_thread = {
     .id = 1,
     .state = RUNNING,
     .attr = DEFAULT_ATTR_INITIALIZER,
     .cancel_state = PTHREAD_CANCEL_ENABLE,
     .cancel_type = PTHREAD_CANCEL_DEFERRED,
     .sched_policy = SCHED_OTHER,
-    .list_index = {-1, -1},
+    .list_slots = {{NULL, NULL}, {NULL, NULL}},
 };
 
 // Current running thread
-static pthread_t current = &main_thread;
+static struct unthread_fiber *current = &main_thread;
 
 // List of threads ready to run
-static struct pthread_list threads_ready = PTHREAD_EMPTY_LIST_INITIALIZER;
+static struct unthread_fiber **threads_ready = NULL;
+static size_t threads_ready_size = 0;
+static size_t threads_ready_cap = 0;
 
 // Number of live threads in the system
 static size_t threads_count = 1;
@@ -386,7 +382,7 @@ static uint32_t rand_u32(uint32_t len) {
   return noise_prng ? rand_u32_prng(len) : rand_u32_io(len);
 }
 
-static void ensure_cap(struct pthread_list *list, size_t additional) {
+static void ensure_cap(struct unthread_list *list, size_t additional) {
   if (list->len + additional > list->cap) {
     size_t old_cap = list->cap;
     size_t new_cap = old_cap;
@@ -414,16 +410,20 @@ static void ensure_cap(struct pthread_list *list, size_t additional) {
   }
 }
 
-static struct pthread_fiber **threads_ptr(struct pthread_list *list) {
-  return list->cap > pthread_empty_list.cap ? list->threads.big
-                                            : list->threads.small;
-}
-
 // Pushes a thread onto the given list. A thread can only be in the the
 // threads_ready and one other list at the same time. It is an error to add a
 // thread to a list multiple times or to add a thread to a non-threads_ready
 // list while it is a member of another non-threads_ready list.
-static void push(struct pthread_list *list, pthread_t thread) {
+static void push(struct unthread_list *list, struct unthread_fiber *thread) {
+  list->len++;
+
+  if (list->head != NULL) {
+    list->head->next = thread;
+  }
+
+  thread->prev = list->head;
+  list->head = thread;
+
   ensure_cap(list, 1);
   size_t index = list->len++;
   threads_ptr(list)[index] = thread;

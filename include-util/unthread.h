@@ -15,7 +15,7 @@ void unthread_yield() { pthread_yield(); }
 
 static inline bool unthread_test() { return true; }
 #else
-static inline unthread_yield() {}
+static inline void unthread_yield() {}
 
 static inline bool unthread_test() { return false; }
 #endif
