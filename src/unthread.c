@@ -536,7 +536,7 @@ static void multiset_grow(struct pthread_multiset *set) {
   }
 
   struct pthread_multiset new_set = (struct pthread_multiset){
-      .entries = malloc(new_cap * sizeof(struct pthread_multiset_entry)),
+      .entries = calloc(new_cap, sizeof(struct pthread_multiset_entry)),
       .cap = new_cap,
       .len = 0,
   };
@@ -1684,7 +1684,7 @@ static void tls_grow(struct tls *tls) {
   }
 
   struct tls new_tls = (struct tls){
-      .entries = malloc(new_cap * sizeof(struct tls_entry)),
+      .entries = calloc(new_cap, sizeof(struct tls_entry)),
       .cap = new_cap,
       .len = 0,
   };
