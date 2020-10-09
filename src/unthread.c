@@ -246,7 +246,7 @@ static FILE *noise_file;
 // State for PRGN-based entropy
 static uint32_t noise_prng_state[4];
 
-void __attribute__((constructor)) pthread_constructor() {
+void __attribute__((constructor(1000))) pthread_constructor() {
   const char *verbose_str = getenv(VERBOSE_ENV);
   verbose = (verbose_str != NULL && strcmp(verbose_str, "true") == 0);
 
