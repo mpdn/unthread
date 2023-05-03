@@ -728,10 +728,12 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     attr = &default_attr;
   }
 
-  bool owns_stack = attr->data.stack_addr != NULL;
+  // If we malloc the stack, then we own it.
+  // And we malloc the stack if it is NULL.
+  bool owns_stack = attr->data.stack_addr == NULL;
 
   pthread_t child =
-      owns_stack ? attr->data.stack_addr : malloc(attr->data.stack_size);
+      owns_stack ? malloc(attr->data.stack_size) : attr->data.stack_addr;
 
   unsigned int id;
   static unsigned int next_id = 2;  // Start at 2 as main thread is 1
