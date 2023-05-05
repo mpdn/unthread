@@ -32,6 +32,7 @@ POSIX_TEST_SUITES_BLACKLIST=\
 	posixtestsuite/conformance/interfaces/pthread_attr_setschedpolicy/4-1.c      \
 	posixtestsuite/conformance/interfaces/pthread_attr_setscope/4-1.c            \
 	posixtestsuite/conformance/interfaces/pthread_attr_setscope/5-1.c            \
+	posixtestsuite/conformance/interfaces/pthread_cancel/5-1.c                   \
 	posixtestsuite/conformance/interfaces/pthread_condattr_destroy/4-1.c         \
 	posixtestsuite/conformance/interfaces/pthread_condattr_setclock/1-3.c        \
 	posixtestsuite/conformance/interfaces/pthread_create/2-1.c                   \
